@@ -1,0 +1,44 @@
+sites:
+  - name: BrokeModeLife
+    url: https://brokemodelife.com
+    amazon_tag: brokemodelife-20
+
+  - name: DontBeHangry
+    url: https://dontbehangry.com
+
+  - name: FineLivingGuide
+    url: https://finelivingguide.com
+
+  - name: StopLookAround
+    url: https://stoplookaround.com
+
+  - name: IllAskForIt
+    url: https://illaskforit.com
+
+email:
+  to: mattpom63@gmail.com
+  subject_prefix: "[Website Health]"
+
+crawler:
+  timeout: 15
+  max_pages_per_site: 100
+  max_external_links: 50
+  user_agent: "WebHealthMonitor/1.0"
+  slow_page_threshold_seconds: 3.0
+
+affiliate_patterns:
+  amazon:
+    - "amazon.com"
+  etsy:
+    - "etsy.com"
+  pinterest:
+    - "pinterest.com"
+  twitter_x:
+    - "twitter.com"
+    - "x.com"
+  instagram:
+    - "instagram.com"
+  booking:
+    - "booking.com"
+  getyourguide:
+    - "getyourguide.com"
