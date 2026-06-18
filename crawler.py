@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Website Health Monitor
-Crawls configured sites and reports issues via email and Make.com webhook.
+Website Health Monitor — Mattpom Digital Ventures
+Crawls 5 content sites, runs 21 checks, emails a report via Brevo SMTP.
 """
 
 import argparse
@@ -9,432 +9,493 @@ import json
 import os
 import re
 import smtplib
-import sys
 import time
 from collections import defaultdict
 from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from typing import Optional
+from pathlib import Path
 from urllib.parse import urljoin, urlparse
+import urllib.request
+import urllib.error
 
 import requests
-import yaml
 from bs4 import BeautifulSoup
 
-# ── Constants ──────────────────────────────────────────────────────────────────
+# ── Config ────────────────────────────────────────────────────────────────────
+SITES = [
+    "https://brokemodelife.com",
+    "https://dontbehangry.com",
+    "https://finelivingguide.com",
+    "https://stoplookaround.com",
+    "https://illaskforit.com",
+]
 
-SEVERITY_CRITICAL = "CRITICAL"
-SEVERITY_WARNING = "WARNING"
-SEVERITY_INFO = "INFO"
-
-ISSUE_FIXES = {
-    "site_down": "Check hosting, DNS, and SSL certificate. Verify server is running.",
-    "http_4xx": "Check the URL is correct and the page exists. Update or remove the link.",
-    "http_5xx": "Server error — check hosting logs, plugins, or contact your host.",
-    "broken_internal_link": "Update or remove the broken internal link on this page.",
-    "broken_external_link": "Remove or replace the broken external link.",
-    "broken_image": "Re-upload the image or update the image src URL.",
-    "missing_amazon_tag": "Add 'brokemodelife-20' as the 'tag' parameter to this Amazon URL.",
-    "redirect_chain": "Update the link to point directly to the final destination URL.",
-    "slow_page": "Optimize images, enable caching, or check server response times.",
-    "no_robots_txt": "Create a robots.txt file at the site root.",
-    "no_sitemap": "Generate and submit a sitemap.xml — use an SEO plugin or Yoast.",
-    "missing_title": "Add a unique, descriptive <title> tag to this page.",
-    "missing_meta_description": "Add a meta description tag with 120–160 characters.",
-    "missing_canonical": "Add a canonical URL tag to prevent duplicate content issues.",
-    "etsy_link": "Verify this Etsy link is active and points to a live product/shop.",
-    "pinterest_link": "Verify this Pinterest link is still active.",
-    "twitter_x_link": "Verify this X/Twitter link is still active.",
-    "instagram_link": "Verify this Instagram link is still active.",
-    "booking_link": "Verify this Booking.com link is still active and not expired.",
-    "getyourguide_link": "Verify this GetYourGuide link is still active.",
+AMAZON_TAG = "brokemodelife-20"
+AFFILIATE_DOMAINS = {
+    "etsy": "etsy.com",
+    "pinterest": "pinterest.com",
+    "twitter_x": "twitter.com",
+    "twitter_x2": "x.com",
+    "instagram": "instagram.com",
+    "booking": "booking.com",
+    "getyourguide": "getyourguide.com",
+    "amazon": "amazon.com",
 }
 
+SLOW_PAGE_THRESHOLD = 5.0  # seconds
+MAX_PAGES_PER_SITE = 50
+REQUEST_TIMEOUT = 15
+CRAWL_DELAY = 0.5
 
-# ── Helpers ─────────────────────────────────────────────────────────────────────
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (compatible; MattpomHealthBot/1.0; "
+        "+https://github.com/mattpom/website-health-monitor)"
+    )
+}
 
-def load_config(path="config.yaml"):
-    with open(path) as f:
-        return yaml.safe_load(f)
+REPORT_DIR = Path("reports")
+REPORT_DIR.mkdir(exist_ok=True)
+
+EMAIL_TO = "mattpom63@gmail.com"
 
 
-def make_session(user_agent: str) -> requests.Session:
-    s = requests.Session()
-    s.headers.update({"User-Agent": user_agent})
-    return s
+# ── Issue model ───────────────────────────────────────────────────────────────
+def issue(severity, page_url, check, detail, fix):
+    return {
+        "severity": severity,   # critical | warning | info
+        "page_url": page_url,
+        "check": check,
+        "detail": detail,
+        "fix": fix,
+    }
 
 
-def safe_get(session, url, timeout=15, allow_redirects=True):
+# ── HTTP helpers ──────────────────────────────────────────────────────────────
+session = requests.Session()
+session.headers.update(HEADERS)
+
+
+def fetch(url, timeout=REQUEST_TIMEOUT):
+    """Return (response, elapsed_seconds) or (None, elapsed)."""
+    t0 = time.time()
     try:
-        r = session.get(url, timeout=timeout, allow_redirects=allow_redirects)
-        return r, None
-    except requests.exceptions.SSLError as e:
-        return None, f"SSL error: {e}"
-    except requests.exceptions.ConnectionError as e:
-        return None, f"Connection error: {e}"
-    except requests.exceptions.Timeout:
-        return None, "Timeout"
-    except Exception as e:
-        return None, str(e)
+        r = session.get(url, timeout=timeout, allow_redirects=True)
+        return r, time.time() - t0
+    except Exception as exc:
+        return None, time.time() - t0
 
 
-def is_same_domain(url: str, base: str) -> bool:
-    return urlparse(url).netloc == urlparse(base).netloc
+def head_ok(url):
+    try:
+        r = session.head(url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+        if r.status_code == 405:
+            r = session.get(url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+        return r.status_code, r.url
+    except Exception:
+        return None, url
 
 
-def normalize_url(url: str) -> str:
-    p = urlparse(url)
-    return p._replace(fragment="").geturl()
+# ── Per-page checks ───────────────────────────────────────────────────────────
+def check_page(page_url, html, elapsed, issues):
+    soup = BeautifulSoup(html, "html.parser")
 
+    # 3. Missing page title
+    title_tag = soup.find("title")
+    if not title_tag or not title_tag.get_text(strip=True):
+        issues.append(issue(
+            "warning", page_url, "missing_title",
+            "No <title> tag found.",
+            "Add a descriptive <title> element to the <head>."
+        ))
 
-def detect_redirect_chain(session, url, timeout=15):
-    """Follow redirects manually and return list of hops."""
-    hops = [url]
-    current = url
-    for _ in range(10):
-        r, err = safe_get(session, current, timeout=timeout, allow_redirects=False)
-        if err or r is None:
-            break
-        if r.status_code in (301, 302, 303, 307, 308):
-            loc = r.headers.get("Location", "")
-            if loc:
-                next_url = urljoin(current, loc)
-                hops.append(next_url)
-                current = next_url
+    # 4. Missing meta description
+    meta_desc = soup.find("meta", attrs={"name": re.compile(r"^description$", re.I)})
+    if not meta_desc or not meta_desc.get("content", "").strip():
+        issues.append(issue(
+            "warning", page_url, "missing_meta_description",
+            "No meta description tag found.",
+            "Add <meta name='description' content='...'> to the <head>."
+        ))
+
+    # 5. Missing canonical URL
+    canonical = soup.find("link", attrs={"rel": re.compile(r"canonical", re.I)})
+    if not canonical or not canonical.get("href", "").strip():
+        issues.append(issue(
+            "warning", page_url, "missing_canonical",
+            "No canonical <link> tag found.",
+            "Add <link rel='canonical' href='...'> to the <head>."
+        ))
+
+    # 6. Slow page
+    if elapsed > SLOW_PAGE_THRESHOLD:
+        issues.append(issue(
+            "warning", page_url, "slow_page",
+            f"Page load time {elapsed:.1f}s exceeds {SLOW_PAGE_THRESHOLD}s threshold.",
+            "Optimise images, enable caching, or use a CDN."
+        ))
+
+    # Collect all links
+    all_links = []
+    for tag in soup.find_all("a", href=True):
+        href = tag["href"].strip()
+        if href.startswith(("mailto:", "tel:", "#", "javascript:")):
+            continue
+        full = urljoin(page_url, href)
+        all_links.append(full)
+
+    # 7. Affiliate link detection
+    for link in all_links:
+        parsed = urlparse(link)
+        netloc = parsed.netloc.lower()
+
+        # Amazon missing tag
+        if "amazon.com" in netloc:
+            if AMAZON_TAG not in link:
+                issues.append(issue(
+                    "critical", page_url, "amazon_missing_tag",
+                    f"Amazon link missing '{AMAZON_TAG}' tag: {link}",
+                    f"Add tag={AMAZON_TAG} parameter to the URL."
+                ))
             else:
-                break
-        else:
-            break
-    return hops
+                issues.append(issue(
+                    "info", page_url, "amazon_affiliate_link",
+                    f"Amazon affiliate link detected: {link}",
+                    "No action needed — tag present."
+                ))
+
+        for label, domain in AFFILIATE_DOMAINS.items():
+            if domain in netloc and domain != "amazon.com":
+                issues.append(issue(
+                    "info", page_url, f"affiliate_link_{label}",
+                    f"{label.title()} link detected: {link}",
+                    "Verify link is still active and properly attributed."
+                ))
+
+    # 8. Redirect chains
+    for link in all_links:
+        try:
+            resp = session.get(link, timeout=10, allow_redirects=True)
+            if len(resp.history) >= 3:
+                chain = " → ".join(
+                    [r.url for r in resp.history] + [resp.url]
+                )
+                issues.append(issue(
+                    "warning", page_url, "redirect_chain",
+                    f"Redirect chain ({len(resp.history)} hops): {chain}",
+                    "Update the link to point directly to the final URL."
+                ))
+        except Exception:
+            pass
+
+    # 9. Broken internal links
+    base_domain = urlparse(page_url).netloc
+    internal = [l for l in all_links if urlparse(l).netloc == base_domain]
+    for link in internal[:30]:  # cap to avoid rate limits
+        status, final = head_ok(link)
+        if status is None:
+            issues.append(issue(
+                "critical", page_url, "broken_internal_link",
+                f"Internal link unreachable: {link}",
+                "Fix or remove the broken link."
+            ))
+        elif 400 <= status < 500:
+            issues.append(issue(
+                "critical", page_url, "http_4xx",
+                f"Internal link returned {status}: {link}",
+                "Fix the URL or add a redirect."
+            ))
+        elif 500 <= status < 600:
+            issues.append(issue(
+                "critical", page_url, "http_5xx",
+                f"Internal link returned {status}: {link}",
+                "Investigate server error at the destination."
+            ))
+
+    # 10. Broken external links (sampled)
+    external = [l for l in all_links if urlparse(l).netloc != base_domain]
+    for link in external[:20]:
+        status, _ = head_ok(link)
+        if status is None:
+            issues.append(issue(
+                "warning", page_url, "broken_external_link",
+                f"External link unreachable: {link}",
+                "Remove or replace the broken external link."
+            ))
+        elif 400 <= status < 500:
+            issues.append(issue(
+                "warning", page_url, "http_4xx_external",
+                f"External link returned {status}: {link}",
+                "Remove or replace the broken external link."
+            ))
+
+    # 11. Broken image URLs
+    for img in soup.find_all("img", src=True):
+        src = urljoin(page_url, img["src"].strip())
+        if not src.startswith("http"):
+            continue
+        status, _ = head_ok(src)
+        if status is None or (400 <= status < 600):
+            issues.append(issue(
+                "warning", page_url, "broken_image",
+                f"Image unreachable ({status}): {src}",
+                "Replace or restore the missing image."
+            ))
 
 
-def contains_affiliate_pattern(url: str, patterns: list) -> bool:
-    return any(p in url for p in patterns)
+# ── Per-site checks ───────────────────────────────────────────────────────────
+def crawl_site(base_url):
+    issues = []
+    visited = set()
+    queue = [base_url]
+    parsed_base = urlparse(base_url)
 
+    # 1. Homepage reachable
+    resp, elapsed = fetch(base_url)
+    if resp is None or resp.status_code >= 400:
+        status = resp.status_code if resp else "unreachable"
+        issues.append(issue(
+            "critical", base_url, "site_down",
+            f"Homepage returned {status}.",
+            "Investigate hosting / DNS immediately."
+        ))
+        return issues  # no point crawling further
 
-def amazon_has_tag(url: str, expected_tag: str) -> bool:
-    m = re.search(r"[?&]tag=([^&]+)", url)
-    if m:
-        return m.group(1) == expected_tag
-    return False
+    # 12. robots.txt
+    robots_url = urljoin(base_url, "/robots.txt")
+    r_robots, _ = fetch(robots_url)
+    if r_robots is None or r_robots.status_code != 200:
+        issues.append(issue(
+            "warning", base_url, "missing_robots_txt",
+            f"robots.txt not found at {robots_url}",
+            "Create a robots.txt file at the site root."
+        ))
 
+    # 13. sitemap.xml
+    sitemap_url = urljoin(base_url, "/sitemap.xml")
+    r_sitemap, _ = fetch(sitemap_url)
+    if r_sitemap is None or r_sitemap.status_code != 200:
+        issues.append(issue(
+            "warning", base_url, "missing_sitemap",
+            f"sitemap.xml not found at {sitemap_url}",
+            "Generate and submit a sitemap.xml."
+        ))
 
-# ── Crawler ──────────────────────────────────────────────────────────────────────
+    # BFS crawl
+    pages_crawled = 0
+    while queue and pages_crawled < MAX_PAGES_PER_SITE:
+        url = queue.pop(0)
+        if url in visited:
+            continue
+        visited.add(url)
 
-class SiteCrawler:
-    def __init__(self, site_config: dict, global_config: dict):
-        self.site = site_config
-        self.cfg = global_config
-        self.crawler_cfg = global_config.get("crawler", {})
-        self.aff = global_config.get("affiliate_patterns", {})
-        self.timeout = self.crawler_cfg.get("timeout", 15)
-        self.max_pages = self.crawler_cfg.get("max_pages_per_site", 100)
-        self.max_ext = self.crawler_cfg.get("max_external_links", 50)
-        self.slow_threshold = self.crawler_cfg.get("slow_page_threshold_seconds", 3.0)
-        self.amazon_tag = site_config.get("amazon_tag")
-        self.base_url = site_config["url"].rstrip("/")
-        self.session = make_session(self.crawler_cfg.get("user_agent", "WebHealthMonitor/1.0"))
-        self.issues = []
-        self.visited = set()
-        self.queue = [self.base_url]
-        self.ext_checked = set()
+        resp, elapsed = fetch(url)
+        if resp is None:
+            issues.append(issue(
+                "critical", url, "page_unreachable",
+                "Page returned no response.",
+                "Investigate server or DNS."
+            ))
+            continue
 
-    def add_issue(self, severity, issue_type, page_url, detail, fix=None):
-        self.issues.append({
-            "severity": severity,
-            "type": issue_type,
-            "page_url": page_url,
-            "detail": detail,
-            "fix": fix or ISSUE_FIXES.get(issue_type, "Review and fix manually."),
-        })
+        if resp.status_code >= 400:
+            lvl = "critical" if resp.status_code >= 500 else "critical"
+            issues.append(issue(
+                lvl, url, f"http_{resp.status_code}",
+                f"Page returned HTTP {resp.status_code}.",
+                "Fix or redirect the URL."
+            ))
+            continue
 
-    def check_robots_sitemap(self):
-        for path, issue_type in [("/robots.txt", "no_robots_txt"), ("/sitemap.xml", "no_sitemap")]:
-            url = self.base_url + path
-            r, err = safe_get(self.session, url, self.timeout)
-            if err or r is None or r.status_code >= 400:
-                self.add_issue(SEVERITY_WARNING, issue_type, url,
-                               f"{path} not found or unreachable (status: {r.status_code if r else err})")
+        content_type = resp.headers.get("Content-Type", "")
+        if "text/html" not in content_type:
+            continue
 
-    def check_page(self, url):
-        start = time.time()
-        r, err = safe_get(self.session, url, self.timeout)
-        elapsed = time.time() - start
+        pages_crawled += 1
+        check_page(url, resp.text, elapsed, issues)
 
-        if err or r is None:
-            self.add_issue(SEVERITY_CRITICAL, "site_down", url, f"Unreachable: {err}")
-            return None
-
-        status = r.status_code
-        if 400 <= status < 500:
-            self.add_issue(SEVERITY_CRITICAL, "http_4xx", url, f"HTTP {status}")
-            return None
-        if status >= 500:
-            self.add_issue(SEVERITY_CRITICAL, "http_5xx", url, f"HTTP {status}")
-            return None
-
-        # Redirect chain check
-        hops = detect_redirect_chain(self.session, url, self.timeout)
-        if len(hops) > 2:
-            self.add_issue(SEVERITY_WARNING, "redirect_chain", url,
-                           f"Redirect chain ({len(hops)} hops): {' → '.join(hops)}")
-
-        # Slow page
-        if elapsed > self.slow_threshold:
-            self.add_issue(SEVERITY_WARNING, "slow_page", url,
-                           f"Page loaded in {elapsed:.1f}s (threshold: {self.slow_threshold}s)")
-
-        soup = BeautifulSoup(r.text, "lxml")
-
-        # SEO checks
-        title = soup.find("title")
-        if not title or not title.get_text(strip=True):
-            self.add_issue(SEVERITY_WARNING, "missing_title", url, "No <title> tag found")
-
-        meta_desc = soup.find("meta", attrs={"name": re.compile("^description$", re.I)})
-        if not meta_desc or not meta_desc.get("content", "").strip():
-            self.add_issue(SEVERITY_WARNING, "missing_meta_description", url, "No meta description found")
-
-        canonical = soup.find("link", attrs={"rel": re.compile("^canonical$", re.I)})
-        if not canonical or not canonical.get("href", "").strip():
-            self.add_issue(SEVERITY_WARNING, "missing_canonical", url, "No canonical URL tag found")
-
-        return soup
-
-    def check_links(self, page_url, soup):
-        links = soup.find_all("a", href=True)
-        for a in links:
+        # Discover more pages on same domain
+        soup = BeautifulSoup(resp.text, "html.parser")
+        for a in soup.find_all("a", href=True):
             href = a["href"].strip()
-            if not href or href.startswith(("#", "mailto:", "tel:", "javascript:")):
+            if href.startswith(("mailto:", "tel:", "#", "javascript:")):
                 continue
+            full = urljoin(url, href)
+            p = urlparse(full)
+            if p.netloc == parsed_base.netloc and full not in visited:
+                queue.append(full)
 
-            full_url = normalize_url(urljoin(page_url, href))
-            parsed = urlparse(full_url)
-            if parsed.scheme not in ("http", "https"):
-                continue
+        time.sleep(CRAWL_DELAY)
 
-            internal = is_same_domain(full_url, self.base_url)
-
-            # Affiliate / social pattern checks (on all links)
-            self._check_affiliate_link(page_url, full_url)
-
-            if internal:
-                if full_url not in self.visited and full_url not in self.queue:
-                    self.queue.append(full_url)
-                # Check internal link status
-                if full_url not in self.visited:
-                    r, err = safe_get(self.session, full_url, self.timeout)
-                    if err or r is None or r.status_code >= 400:
-                        self.add_issue(SEVERITY_CRITICAL, "broken_internal_link", page_url,
-                                       f"Broken internal link: {full_url} ({r.status_code if r else err})")
-            else:
-                if full_url not in self.ext_checked and len(self.ext_checked) < self.max_ext:
-                    self.ext_checked.add(full_url)
-                    r, err = safe_get(self.session, full_url, self.timeout)
-                    if err or r is None or r.status_code >= 400:
-                        self.add_issue(SEVERITY_WARNING, "broken_external_link", page_url,
-                                       f"Broken external link: {full_url} ({r.status_code if r else err})")
-
-    def _check_affiliate_link(self, page_url, url):
-        # Amazon
-        if contains_affiliate_pattern(url, self.aff.get("amazon", [])):
-            if self.amazon_tag and not amazon_has_tag(url, self.amazon_tag):
-                self.add_issue(SEVERITY_CRITICAL, "missing_amazon_tag", page_url,
-                               f"Amazon link missing '{self.amazon_tag}' tag: {url}")
-            else:
-                self.add_issue(SEVERITY_INFO, "etsy_link" if "etsy" in url else "amazon_link",
-                               page_url, f"Amazon link found: {url}")
-        # Etsy
-        if contains_affiliate_pattern(url, self.aff.get("etsy", [])):
-            self.add_issue(SEVERITY_INFO, "etsy_link", page_url, f"Etsy link: {url}")
-        # Pinterest
-        if contains_affiliate_pattern(url, self.aff.get("pinterest", [])):
-            self.add_issue(SEVERITY_INFO, "pinterest_link", page_url, f"Pinterest link: {url}")
-        # Twitter/X
-        if contains_affiliate_pattern(url, self.aff.get("twitter_x", [])):
-            self.add_issue(SEVERITY_INFO, "twitter_x_link", page_url, f"X/Twitter link: {url}")
-        # Instagram
-        if contains_affiliate_pattern(url, self.aff.get("instagram", [])):
-            self.add_issue(SEVERITY_INFO, "instagram_link", page_url, f"Instagram link: {url}")
-        # Booking
-        if contains_affiliate_pattern(url, self.aff.get("booking", [])):
-            self.add_issue(SEVERITY_INFO, "booking_link", page_url, f"Booking.com link: {url}")
-        # GetYourGuide
-        if contains_affiliate_pattern(url, self.aff.get("getyourguide", [])):
-            self.add_issue(SEVERITY_INFO, "getyourguide_link", page_url, f"GetYourGuide link: {url}")
-
-    def check_images(self, page_url, soup):
-        for img in soup.find_all("img", src=True):
-            src = img["src"].strip()
-            if not src or src.startswith("data:"):
-                continue
-            full_url = normalize_url(urljoin(page_url, src))
-            r, err = safe_get(self.session, full_url, self.timeout)
-            if err or r is None or r.status_code >= 400:
-                self.add_issue(SEVERITY_WARNING, "broken_image", page_url,
-                               f"Broken image: {full_url} ({r.status_code if r else err})")
-
-    def run(self):
-        print(f"\n{'='*60}")
-        print(f"Crawling: {self.base_url}")
-        print(f"{'='*60}")
-
-        # robots + sitemap first
-        self.check_robots_sitemap()
-
-        pages_crawled = 0
-        while self.queue and pages_crawled < self.max_pages:
-            url = self.queue.pop(0)
-            if url in self.visited:
-                continue
-            self.visited.add(url)
-            pages_crawled += 1
-
-            print(f"  [{pages_crawled}/{self.max_pages}] {url}")
-            soup = self.check_page(url)
-            if soup:
-                self.check_links(url, soup)
-                self.check_images(url, soup)
-
-        criticals = sum(1 for i in self.issues if i["severity"] == SEVERITY_CRITICAL)
-        warnings = sum(1 for i in self.issues if i["severity"] == SEVERITY_WARNING)
-        print(f"  Done. Pages: {pages_crawled} | Issues: {criticals} critical, {warnings} warnings")
-        return self.issues
+    return issues
 
 
-# ── Report Generation ────────────────────────────────────────────────────────────
+# ── Report building ───────────────────────────────────────────────────────────
+def build_report(mode):
+    now = datetime.now(timezone.utc)
+    all_issues = []
+    site_summaries = {}
 
-def generate_reports(all_results: dict, mode: str, run_ts: str):
-    os.makedirs("reports", exist_ok=True)
-    slug = run_ts.replace(":", "-").replace(" ", "_")
+    for site in SITES:
+        print(f"  Crawling {site} …")
+        site_issues = crawl_site(site)
+        all_issues.extend(site_issues)
+        site_summaries[site] = {
+            "critical": sum(1 for i in site_issues if i["severity"] == "critical"),
+            "warning": sum(1 for i in site_issues if i["severity"] == "warning"),
+            "info": sum(1 for i in site_issues if i["severity"] == "info"),
+        }
 
-    total_critical = sum(
-        sum(1 for i in issues if i["severity"] == SEVERITY_CRITICAL)
-        for issues in all_results.values()
-    )
-    total_warning = sum(
-        sum(1 for i in issues if i["severity"] == SEVERITY_WARNING)
-        for issues in all_results.values()
-    )
+    total_critical = sum(s["critical"] for s in site_summaries.values())
+    total_warning = sum(s["warning"] for s in site_summaries.values())
 
-    # JSON
-    json_path = f"reports/health_{mode}_{slug}.json"
-    with open(json_path, "w") as f:
-        json.dump({
-            "run_at": run_ts,
-            "mode": mode,
-            "summary": {"critical": total_critical, "warnings": total_warning},
-            "sites": all_results,
-        }, f, indent=2)
-
-    # Plain text
-    txt_path = f"reports/health_{mode}_{slug}.txt"
-    with open(txt_path, "w") as f:
-        f.write(build_text_report(all_results, mode, run_ts, total_critical, total_warning))
-
-    # HTML
-    html_path = f"reports/health_{mode}_{slug}.html"
-    with open(html_path, "w") as f:
-        f.write(build_html_report(all_results, mode, run_ts, total_critical, total_warning))
-
-    return json_path, txt_path, html_path, total_critical, total_warning
+    report = {
+        "generated_at": now.isoformat(),
+        "mode": mode,
+        "total_critical": total_critical,
+        "total_warning": total_warning,
+        "site_summaries": site_summaries,
+        "issues": all_issues,
+    }
+    return report
 
 
-def build_text_report(all_results, mode, run_ts, total_critical, total_warnings):
+# ── File output ───────────────────────────────────────────────────────────────
+def save_reports(report):
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+
+    json_path = REPORT_DIR / f"report_{ts}.json"
+    json_path.write_text(json.dumps(report, indent=2))
+
+    txt_path = REPORT_DIR / f"report_{ts}.txt"
+    txt_path.write_text(build_text_report(report))
+
+    html_path = REPORT_DIR / f"report_{ts}.html"
+    html_path.write_text(build_html_report(report))
+
+    return json_path, txt_path, html_path
+
+
+def build_text_report(report):
     lines = []
-    lines.append(f"WEBSITE HEALTH REPORT — {mode.upper()}")
-    lines.append(f"Run: {run_ts}")
-    lines.append(f"Summary: {total_critical} CRITICAL | {total_warnings} WARNINGS")
     lines.append("=" * 70)
-
-    for site_name, issues in all_results.items():
-        crits = [i for i in issues if i["severity"] == SEVERITY_CRITICAL]
-        warns = [i for i in issues if i["severity"] == SEVERITY_WARNING]
-        lines.append(f"\n▶ {site_name}  ({len(crits)} critical, {len(warns)} warnings)")
-        lines.append("-" * 50)
-        for sev, group in [("CRITICAL", crits), ("WARNING", warns)]:
-            for issue in group:
-                lines.append(f"  [{sev}] {issue['type'].upper().replace('_', ' ')}")
-                lines.append(f"    Page : {issue['page_url']}")
-                lines.append(f"    Issue: {issue['detail']}")
-                lines.append(f"    Fix  : {issue['fix']}")
-                lines.append("")
-
+    lines.append("MATTPOM DIGITAL VENTURES — WEBSITE HEALTH REPORT")
+    lines.append(f"Generated: {report['generated_at']}  |  Mode: {report['mode'].upper()}")
     lines.append("=" * 70)
-    lines.append("Mattpom Digital Ventures — Website Health Monitor")
+    lines.append(f"\nSUMMARY: {report['total_critical']} CRITICAL  |  {report['total_warning']} WARNINGS\n")
+
+    for site, s in report["site_summaries"].items():
+        lines.append(f"  {site}  →  {s['critical']} critical, {s['warning']} warnings, {s['info']} info")
+
+    lines.append("\n" + "-" * 70)
+    lines.append("CRITICAL ISSUES")
+    lines.append("-" * 70)
+    crits = [i for i in report["issues"] if i["severity"] == "critical"]
+    if crits:
+        for i in crits:
+            lines.append(f"\n[{i['check'].upper()}]")
+            lines.append(f"  Page  : {i['page_url']}")
+            lines.append(f"  Detail: {i['detail']}")
+            lines.append(f"  Fix   : {i['fix']}")
+    else:
+        lines.append("  None — great job!")
+
+    lines.append("\n" + "-" * 70)
+    lines.append("WARNINGS")
+    lines.append("-" * 70)
+    warns = [i for i in report["issues"] if i["severity"] == "warning"]
+    if warns:
+        for i in warns:
+            lines.append(f"\n[{i['check'].upper()}]")
+            lines.append(f"  Page  : {i['page_url']}")
+            lines.append(f"  Detail: {i['detail']}")
+            lines.append(f"  Fix   : {i['fix']}")
+    else:
+        lines.append("  None.")
+
     return "\n".join(lines)
 
 
-def build_html_report(all_results, mode, run_ts, total_critical, total_warnings):
-    sev_color = {SEVERITY_CRITICAL: "#dc3545", SEVERITY_WARNING: "#fd7e14", SEVERITY_INFO: "#6c757d"}
+def build_html_report(report):
+    crits = [i for i in report["issues"] if i["severity"] == "critical"]
+    warns = [i for i in report["issues"] if i["severity"] == "warning"]
+    infos = [i for i in report["issues"] if i["severity"] == "info"]
 
-    rows_by_site = ""
-    for site_name, issues in all_results.items():
-        crits = [i for i in issues if i["severity"] == SEVERITY_CRITICAL]
-        warns = [i for i in issues if i["severity"] == SEVERITY_WARNING]
-        rows_by_site += f"""
-        <h3 style="margin-top:24px;color:#333">▶ {site_name}
-          <span style="font-size:13px;font-weight:normal;color:#888">
-            {len(crits)} critical &bull; {len(warns)} warnings
-          </span>
-        </h3>
-        <table width="100%" cellpadding="8" cellspacing="0" style="border-collapse:collapse;font-size:13px">
-          <thead>
-            <tr style="background:#f5f5f5">
-              <th align="left" width="90">Severity</th>
-              <th align="left" width="160">Issue</th>
-              <th align="left">Page URL</th>
-              <th align="left">Detail</th>
-              <th align="left">Fix</th>
-            </tr>
-          </thead>
-          <tbody>
-        """
-        for issue in sorted(issues, key=lambda x: (x["severity"] != SEVERITY_CRITICAL, x["severity"])):
-            if issue["severity"] == SEVERITY_INFO:
-                continue
-            color = sev_color.get(issue["severity"], "#333")
-            rows_by_site += f"""
-            <tr style="border-bottom:1px solid #eee">
-              <td><span style="color:{color};font-weight:bold">{issue['severity']}</span></td>
-              <td>{issue['type'].replace('_', ' ').title()}</td>
-              <td style="word-break:break-all;max-width:200px"><a href="{issue['page_url']}" style="color:#0066cc">{issue['page_url']}</a></td>
-              <td style="word-break:break-all">{issue['detail']}</td>
-              <td>{issue['fix']}</td>
-            </tr>
-            """
-        rows_by_site += "</tbody></table>"
+    def rows(issues):
+        if not issues:
+            return "<tr><td colspan='4' style='color:#888'>None found.</td></tr>"
+        out = []
+        for i in issues:
+            bg = "#fff0f0" if i["severity"] == "critical" else "#fffbe6" if i["severity"] == "warning" else "#f0f8ff"
+            out.append(
+                f"<tr style='background:{bg}'>"
+                f"<td style='word-break:break-all'><a href='{i['page_url']}'>{i['page_url']}</a></td>"
+                f"<td>{i['check']}</td>"
+                f"<td>{i['detail']}</td>"
+                f"<td>{i['fix']}</td>"
+                f"</tr>"
+            )
+        return "\n".join(out)
+
+    site_rows = ""
+    for site, s in report["site_summaries"].items():
+        site_rows += (
+            f"<tr><td><a href='{site}'>{site}</a></td>"
+            f"<td style='color:#c00'>{s['critical']}</td>"
+            f"<td style='color:#b8860b'>{s['warning']}</td>"
+            f"<td style='color:#555'>{s['info']}</td></tr>"
+        )
 
     return f"""<!DOCTYPE html>
-<html>
-<head><meta charset="utf-8"><title>Website Health Report</title></head>
-<body style="font-family:Arial,sans-serif;max-width:1100px;margin:0 auto;padding:20px;color:#333">
-  <div style="background:#1a1a2e;color:white;padding:20px 24px;border-radius:8px;margin-bottom:24px">
-    <h1 style="margin:0;font-size:20px">🔍 Website Health Report — {mode.upper()}</h1>
-    <p style="margin:6px 0 0;opacity:.8;font-size:13px">Run: {run_ts}</p>
-  </div>
-  <div style="display:flex;gap:16px;margin-bottom:24px">
-    <div style="flex:1;background:#fff5f5;border:1px solid #ffcccc;border-radius:8px;padding:16px;text-align:center">
-      <div style="font-size:36px;font-weight:bold;color:#dc3545">{total_critical}</div>
-      <div style="color:#888;font-size:13px">CRITICAL</div>
-    </div>
-    <div style="flex:1;background:#fff8f0;border:1px solid #ffd8a8;border-radius:8px;padding:16px;text-align:center">
-      <div style="font-size:36px;font-weight:bold;color:#fd7e14">{total_warnings}</div>
-      <div style="color:#888;font-size:13px">WARNINGS</div>
-    </div>
-  </div>
-  {rows_by_site}
-  <p style="margin-top:32px;font-size:11px;color:#aaa;text-align:center">
-    Mattpom Digital Ventures — Website Health Monitor
-  </p>
-</body>
-</html>"""
+<html lang="en">
+<head><meta charset="utf-8"><title>Website Health Report</title>
+<style>
+body{{font-family:Arial,sans-serif;font-size:14px;color:#222;margin:20px}}
+h1{{color:#1a1a2e}}h2{{color:#16213e;margin-top:30px}}
+table{{border-collapse:collapse;width:100%;margin-bottom:20px}}
+th{{background:#16213e;color:#fff;padding:8px 10px;text-align:left}}
+td{{padding:7px 10px;border-bottom:1px solid #ddd;vertical-align:top}}
+.badge{{display:inline-block;padding:2px 8px;border-radius:4px;font-weight:bold}}
+.crit{{background:#c00;color:#fff}}.warn{{background:#e6ac00;color:#fff}}.info{{background:#0078d4;color:#fff}}
+</style></head>
+<body>
+<h1>🏥 Mattpom Digital Ventures — Website Health Report</h1>
+<p><strong>Generated:</strong> {report['generated_at']} &nbsp;|&nbsp; <strong>Mode:</strong> {report['mode'].upper()}</p>
+<p>
+  <span class="badge crit">{report['total_critical']} Critical</span> &nbsp;
+  <span class="badge warn">{report['total_warning']} Warnings</span> &nbsp;
+  <span class="badge info">{len(infos)} Info</span>
+</p>
+
+<h2>Site Summary</h2>
+<table>
+<tr><th>Site</th><th>Critical</th><th>Warnings</th><th>Info</th></tr>
+{site_rows}
+</table>
+
+<h2>🚨 Critical Issues</h2>
+<table>
+<tr><th>Page URL</th><th>Check</th><th>Detail</th><th>Recommended Fix</th></tr>
+{rows(crits)}
+</table>
+
+<h2>⚠️ Warnings</h2>
+<table>
+<tr><th>Page URL</th><th>Check</th><th>Detail</th><th>Recommended Fix</th></tr>
+{rows(warns)}
+</table>
+
+<h2>ℹ️ Info</h2>
+<table>
+<tr><th>Page URL</th><th>Check</th><th>Detail</th><th>Recommended Fix</th></tr>
+{rows(infos)}
+</table>
+</body></html>"""
 
 
-# ── Email ─────────────────────────────────────────────────────────────────────────
-
-def send_email(cfg: dict, txt_report: str, html_report: str, total_critical: int, total_warnings: int, mode: str):
+# ── Email ─────────────────────────────────────────────────────────────────────
+def send_email(report, txt_body, html_body):
     smtp_host = os.environ.get("SMTP_HOST")
     smtp_port = int(os.environ.get("SMTP_PORT", 587))
     smtp_user = os.environ.get("SMTP_USER")
@@ -442,91 +503,79 @@ def send_email(cfg: dict, txt_report: str, html_report: str, total_critical: int
     smtp_from = os.environ.get("SMTP_FROM", smtp_user)
 
     if not all([smtp_host, smtp_user, smtp_pass]):
-        print("⚠️  SMTP secrets not set — skipping email.")
+        print("  ⚠  SMTP secrets not configured — skipping email.")
         return
 
-    to_addr = cfg["email"]["to"]
-    prefix = cfg["email"].get("subject_prefix", "[Website Health]")
-    subject = f"{prefix} {mode.upper()} — {total_critical} Critical, {total_warnings} Warnings"
+    c = report["total_critical"]
+    w = report["total_warning"]
+    subject = (
+        f"[{'🚨 CRITICAL' if c else '✅ OK'}] Website Health: "
+        f"{c} critical, {w} warnings — {datetime.now(timezone.utc).strftime('%Y-%m-%d')}"
+    )
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
     msg["From"] = smtp_from
-    msg["To"] = to_addr
-    msg.attach(MIMEText(txt_report, "plain"))
-    msg.attach(MIMEText(html_report, "html"))
+    msg["To"] = EMAIL_TO
+    msg.attach(MIMEText(txt_body, "plain"))
+    msg.attach(MIMEText(html_body, "html"))
 
     try:
         with smtplib.SMTP(smtp_host, smtp_port) as server:
             server.ehlo()
             server.starttls()
             server.login(smtp_user, smtp_pass)
-            server.sendmail(smtp_from, [to_addr], msg.as_string())
-        print(f"✅ Email sent to {to_addr}")
-    except Exception as e:
-        print(f"❌ Email failed: {e}")
+            server.sendmail(smtp_from, [EMAIL_TO], msg.as_string())
+        print(f"  ✅ Email sent to {EMAIL_TO}")
+    except Exception as exc:
+        print(f"  ❌ Email failed: {exc}")
 
 
-# ── Make.com Webhook ──────────────────────────────────────────────────────────────
-
-def send_webhook(all_results: dict, total_critical: int, total_warnings: int, mode: str, run_ts: str):
-    webhook_url = os.environ.get("MAKE_WEBHOOK_URL")
-    if not webhook_url:
+# ── Make.com webhook ──────────────────────────────────────────────────────────
+def ping_webhook(report):
+    url = os.environ.get("MAKE_WEBHOOK_URL")
+    if not url:
         return
-    payload = {
-        "run_at": run_ts,
-        "mode": mode,
-        "total_critical": total_critical,
-        "total_warnings": total_warnings,
-        "sites": {
-            name: {
-                "critical": sum(1 for i in issues if i["severity"] == SEVERITY_CRITICAL),
-                "warnings": sum(1 for i in issues if i["severity"] == SEVERITY_WARNING),
-            }
-            for name, issues in all_results.items()
-        },
-    }
     try:
-        r = requests.post(webhook_url, json=payload, timeout=15)
-        print(f"✅ Webhook sent: {r.status_code}")
-    except Exception as e:
-        print(f"⚠️  Webhook failed: {e}")
+        payload = {
+            "total_critical": report["total_critical"],
+            "total_warning": report["total_warning"],
+            "mode": report["mode"],
+            "generated_at": report["generated_at"],
+        }
+        requests.post(url, json=payload, timeout=10)
+        print("  ✅ Make.com webhook triggered.")
+    except Exception as exc:
+        print(f"  ⚠  Make.com webhook failed: {exc}")
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────────
-
+# ── Entry point ───────────────────────────────────────────────────────────────
 def main():
-    parser = argparse.ArgumentParser(description="Website Health Monitor")
+    parser = argparse.ArgumentParser()
     parser.add_argument("--mode", default="daily", choices=["daily", "weekly", "monthly"])
-    parser.add_argument("--config", default="config.yaml")
     args = parser.parse_args()
 
-    cfg = load_config(args.config)
-    run_ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    print(f"\n🔍 Website Health Monitor starting — mode={args.mode}")
+    print(f"   {datetime.now(timezone.utc).isoformat()}\n")
 
-    all_results = {}
-    for site in cfg["sites"]:
-        crawler = SiteCrawler(site, cfg)
-        issues = crawler.run()
-        all_results[site["name"]] = issues
+    report = build_report(args.mode)
+    json_path, txt_path, html_path = save_reports(report)
 
-    json_path, txt_path, html_path, total_critical, total_warnings = generate_reports(
-        all_results, args.mode, run_ts
-    )
+    print(f"\n📄 Reports saved:")
+    print(f"   JSON : {json_path}")
+    print(f"   TEXT : {txt_path}")
+    print(f"   HTML : {html_path}")
 
-    print(f"\n📄 Reports saved: {json_path}, {txt_path}, {html_path}")
-    print(f"📊 Total: {total_critical} critical, {total_warnings} warnings\n")
+    txt_body = txt_path.read_text()
+    html_body = html_path.read_text()
 
-    with open(txt_path) as f:
-        txt_report = f.read()
-    with open(html_path) as f:
-        html_report = f.read()
+    print("\n📧 Sending email …")
+    send_email(report, txt_body, html_body)
 
-    send_email(cfg, txt_report, html_report, total_critical, total_warnings, args.mode)
-    send_webhook(all_results, total_critical, total_warnings, args.mode, run_ts)
+    print("\n🔗 Pinging Make.com webhook …")
+    ping_webhook(report)
 
-    if total_critical > 0:
-        sys.exit(1)
+    print(f"\n✅ Done — {report['total_critical']} critical, {report['total_warning']} warnings.\n")
 
 
 if __name__ == "__main__":
