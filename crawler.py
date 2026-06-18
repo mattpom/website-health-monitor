@@ -58,7 +58,7 @@ HEADERS = {
 REPORT_DIR = Path("reports")
 REPORT_DIR.mkdir(exist_ok=True)
 
-EMAIL_TO = "mattpom63@gmail.com"
+EMAIL_TO = "mattpom01@gmail.com"
 
 
 # ── Issue model ───────────────────────────────────────────────────────────────
