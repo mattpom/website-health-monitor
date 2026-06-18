@@ -3,7 +3,6 @@ name: Website Health Monitor
 on:
   schedule:
     # Daily 7:00 AM Eastern during daylight time = 11:00 UTC.
-    # During standard time this will run at 6:00 AM Eastern unless adjusted.
     - cron: "0 11 * * *"
     # Weekly Sunday summary at 8:00 AM Eastern during daylight time.
     - cron: "0 12 * * 0"
