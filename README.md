@@ -1,69 +1,53 @@
-# Website Health Monitor
+# Website Health Monitor — Mattpom Digital Ventures
 
-Automated daily crawler for Mattpom Digital Ventures properties. Checks for broken links, missing SEO tags, affiliate link issues, and site availability. Reports by email and optional Make.com webhook.
+Automated daily health crawler for five content sites. Runs 21 checks, emails a report, and uploads artifacts via GitHub Actions.
 
 ## Sites Monitored
+- https://brokemodelife.com
+- https://dontbehangry.com
+- https://finelivingguide.com
+- https://stoplookaround.com
+- https://illaskforit.com
 
-| Site | URL |
-|------|-----|
-| BrokeModeLife | https://brokemodelife.com |
-| DontBeHangry | https://dontbehangry.com |
-| FineLivingGuide | https://finelivingguide.com |
-| StopLookAround | https://stoplookaround.com |
-| IllAskForIt | https://illaskforit.com |
+## Checks (21)
+| # | Check | Severity |
+|---|-------|----------|
+| 1 | Site down / homepage unreachable | Critical |
+| 2 | HTTP 4xx errors | Critical |
+| 3 | HTTP 5xx errors | Critical |
+| 4 | Broken internal links | Critical |
+| 5 | Broken external links | Warning |
+| 6 | Broken image URLs | Warning |
+| 7 | Etsy affiliate links detected | Info |
+| 8 | Amazon Associates links detected | Info |
+| 9 | Amazon links missing `brokemodelife-20` tag | **Critical** |
+| 10 | Pinterest links detected | Info |
+| 11 | X/Twitter links detected | Info |
+| 12 | Instagram links detected | Info |
+| 13 | Booking.com links detected | Info |
+| 14 | GetYourGuide links detected | Info |
+| 15 | Redirect chains (3+ hops) | Warning |
+| 16 | Slow pages (>5s) | Warning |
+| 17 | robots.txt missing | Warning |
+| 18 | sitemap.xml missing | Warning |
+| 19 | Missing page title | Warning |
+| 20 | Missing meta description | Warning |
+| 21 | Missing canonical URL | Warning |
 
-## Checks Performed
-
-- ✅ Site down / homepage unreachable
-- ✅ HTTP 4xx and 5xx errors
-- ✅ Broken internal and external links
-- ✅ Broken image URLs
-- ✅ Amazon links missing `brokemodelife-20` tag
-- ✅ Etsy, Pinterest, X/Twitter, Instagram links
-- ✅ Booking.com and GetYourGuide links
-- ✅ Redirect chains
-- ✅ Slow pages (>3s)
-- ✅ robots.txt availability
-- ✅ sitemap.xml availability
-- ✅ Missing page title
-- ✅ Missing meta description
-- ✅ Missing canonical URL
-
-## GitHub Secrets Required
-
-Set these in **Settings → Secrets and variables → Actions**:
-
+## Required GitHub Secrets
 | Secret | Description |
 |--------|-------------|
-| `SMTP_HOST` | SMTP server hostname (e.g. `smtp.brevo.com`) |
-| `SMTP_PORT` | SMTP port (e.g. `587`) |
-| `SMTP_USER` | SMTP username / login |
-| `SMTP_PASSWORD` | SMTP password or API key |
-| `SMTP_FROM` | From email address |
+| `SMTP_HOST` | Brevo SMTP host (e.g. `smtp-relay.brevo.com`) |
+| `SMTP_PORT` | Usually `587` |
+| `SMTP_USER` | Brevo SMTP login (your email) |
+| `SMTP_PASSWORD` | Brevo SMTP key |
+| `SMTP_FROM` | From address |
 | `MAKE_WEBHOOK_URL` | *(Optional)* Make.com webhook URL |
 
-## Schedule
-
-| Run | Time |
-|-----|------|
-| Daily | 7:00 AM ET (11:00 UTC) |
-| Weekly summary | Sunday 8:00 AM ET |
-| Monthly summary | 1st of month 8:30 AM ET |
-
 ## Manual Run
+1. Go to **Actions → Website Health Monitor → Run workflow**
+2. Select mode: `daily`, `weekly`, or `monthly`
+3. Click **Run workflow**
 
-1. Go to **Actions** → **Website Health Monitor**
-2. Click **Run workflow**
-3. Select mode: `daily`, `weekly`, or `monthly`
-4. Click **Run workflow**
-
-## Reports
-
-After each run, find reports under **Actions → [run] → Artifacts → website-health-reports**. Contains JSON, HTML, and plain text versions.
-
-## Local Run
-
-```bash
-pip install -r requirements.txt
-python crawler.py --mode daily
-```
+## Report Artifacts
+After each run: **Actions → the run → Artifacts → website-health-reports**
